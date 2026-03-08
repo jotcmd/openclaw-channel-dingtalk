@@ -43,6 +43,7 @@ export interface DingTalkConfig extends OpenClawConfig {
   allowFrom?: string[];
   mediaUrlAllowlist?: string[];
   showThinking?: boolean;
+  thinkingMessage?: string;
   debug?: boolean;
   messageType?: "markdown" | "card";
   cardTemplateId?: string;
@@ -82,6 +83,7 @@ export interface DingTalkChannelConfig {
   allowFrom?: string[];
   mediaUrlAllowlist?: string[];
   showThinking?: boolean;
+  thinkingMessage?: string;
   debug?: boolean;
   messageType?: "markdown" | "card";
   cardTemplateId?: string;
@@ -157,15 +159,22 @@ export interface DingTalkInboundMessage {
     content: string;
     isReplyMsg?: boolean; // 是否是回复消息
     repliedMsg?: {
-      // 被回复的消息
+      msgType?: string;
+      msgId?: string;
+      senderId?: string;
+      createdAt?: number;
       content?: {
         text?: string;
+        downloadCode?: string;
+        biz_custom_action_url?: string;
         richText?: Array<{
           msgType?: string;
           type?: string;
           content?: string;
+          text?: string;
           code?: string;
           atName?: string;
+          downloadCode?: string;
         }>;
       };
     };
@@ -174,13 +183,16 @@ export interface DingTalkInboundMessage {
     downloadCode?: string;
     fileName?: string;
     recognition?: string;
+    spaceId?: string;
+    fileId?: string;
+    biz_custom_action_url?: string;
     richText?: Array<{
       type: string;
       text?: string;
       atName?: string;
-      downloadCode?: string; // For picture type in richText
+      downloadCode?: string;
     }>;
-    quoteContent?: string; // 替代引用格式
+    quoteContent?: string;
   };
   // Legacy 引用格式
   quoteMessage?: {
@@ -192,6 +204,7 @@ export interface DingTalkInboundMessage {
   };
   // 富媒体引用，仅有消息ID的情况（包括手机端和PC端）
   originalMsgId?: string;
+  originalProcessQueryKey?: string;
   conversationType: string;
   conversationId: string;
   conversationTitle?: string;
@@ -203,6 +216,26 @@ export interface DingTalkInboundMessage {
 }
 
 /**
+ * Quoted/reply message metadata extracted from repliedMsg.
+ * Populated when isReplyMsg is true; downstream handlers use these fields
+ * to download quoted media or look up cached card content.
+ */
+export interface QuotedInfo {
+  prefix: string;
+  mediaDownloadCode?: string;
+  mediaType?: string;
+  isQuotedFile?: boolean;
+  isQuotedCard?: boolean;
+  isQuotedDocCard?: boolean;
+  docSpaceId?: string;
+  docFileId?: string;
+  cardCreatedAt?: number;
+  processQueryKey?: string;
+  fileCreatedAt?: number;
+  msgId?: string;
+}
+
+/**
  * Extracted message content for unified processing
  */
 export interface MessageContent {
@@ -210,6 +243,9 @@ export interface MessageContent {
   mediaPath?: string;
   mediaType?: string;
   messageType: string;
+  docSpaceId?: string;
+  docFileId?: string;
+  quoted?: QuotedInfo;
 }
 
 /**
@@ -453,6 +489,7 @@ export type AICardState = (typeof AICardStatus)[keyof typeof AICardStatus];
  */
 export interface AICardInstance {
   cardInstanceId: string;
+  processQueryKey?: string;
   accessToken: string;
   conversationId: string;
   accountId?: string;
@@ -572,6 +609,7 @@ export function resolveDingTalkAccount(
       groupPolicy: dingtalk?.groupPolicy,
       allowFrom: dingtalk?.allowFrom,
       showThinking: dingtalk?.showThinking,
+      thinkingMessage: dingtalk?.thinkingMessage,
       debug: dingtalk?.debug,
       messageType: dingtalk?.messageType,
       cardTemplateId: dingtalk?.cardTemplateId,

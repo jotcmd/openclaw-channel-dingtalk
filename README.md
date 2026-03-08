@@ -20,10 +20,21 @@
 - ✅ **Stream 模式** — WebSocket 长连接，无需公网 IP 或 Webhook
 - ✅ **私聊支持** — 直接与机器人对话
 - ✅ **群聊支持** — 在群里 @机器人
-- ✅ **多种消息类型** — 文本、图片、语音（自带识别）、视频、文件
+- ✅ **多种消息类型** — 文本、图片、语音（自带识别）、视频、文件、钉钉文档/钉盘文件卡片
+- ✅ **引用消息支持** — 支持恢复大多数引用场景（文字/图片/图文/文件/视频/语音/AI 卡片），优先走确定性索引；`钉钉文档/钉盘文件卡片` 目前仅支持单聊引用，群聊引用暂不支持
 - ✅ **Markdown 回复** — 支持富文本格式回复
 - ✅ **互动卡片** — 支持流式更新，适用于 AI 实时输出
 - ✅ **完整 AI 对话** — 接入 Clawdbot 消息处理管道
+
+### 进程级（memory-only）运行态说明
+
+以下命名空间/状态刻意保持为**仅进程内内存态**，不会进行磁盘持久化：
+
+- `dedup.processed-message`（消息去重窗口）
+- `session.lock`（同 session 串行锁）
+- `channel.inflight`（gateway in-flight 防重锁）
+
+这样设计是为了保证并发控制语义简单且可预期，避免跨进程/重启后引入锁状态不一致问题。
 
 ## 安装
 
@@ -222,6 +233,28 @@ openclaw configure --section channels
 - ✅ **机器人消息发送相关权限** — 允许机器人向单聊/群聊发送消息
 - ✅ **媒体文件上传相关权限** — 允许调用媒体上传接口发送图片、语音、视频、文件
 
+以下权限仅在需要**引用消息中的群文件下载**时开通（群聊中引用文件/视频/语音）：
+
+- ✅ **ConvFile.Space.Read** — 群文件空间读权限
+- ✅ **Storage.File.Read** — 企业存储文件读权限
+- ✅ **Storage.DownloadInfo.Read** — 企业存储文件下载信息读权限
+- ✅ **Contact.User.Read** — 通讯录用户信息读权限（senderStaffId → unionId 转换）
+
+> [!WARNING]
+> **群文件/钉盘 API 可用性限制**
+>
+> 群聊中“引用文件/视频/语音”的首次恢复依赖 `quotedFile.resolve` 这条群文件/钉盘 API 链路。实际测试发现，这条链路除了权限开通外，还可能要求当前企业具备**企业认证**；未满足时钉钉会返回类似：
+>
+> ```text
+> code=orgAuthLevelNotEnough
+> message=auth level of org is not enough
+> ```
+>
+> 这意味着该能力对许多**未开通企业认证的企业**并不可用，可视为带 paywall 的平台限制。此时：
+>
+> - 单聊文件/视频/语音引用仍可正常使用（前提是机器人见过原文件消息）
+> - 群聊文件/视频/语音若机器人从未见过原消息，则首次恢复可能失败，并降级为提示文本
+
 **步骤：**
 
 1. 进入应用 → 权限管理
@@ -286,6 +319,8 @@ openclaw configure --section channels
       "agentId": "123456789",
       "dmPolicy": "open",
       "groupPolicy": "open",
+      "showThinking": true, // 仅 markdown 模式生效
+      "thinkingMessage": "🤔 思考中，请稍候...", // 仅 markdown 模式生效
       "debug": false,
       "messageType": "markdown", // 或 "card"
       // "mediaMaxMb": 20,  // 可选：接收文件大小上限（MB），默认 5 MB
@@ -320,6 +355,8 @@ openclaw gateway restart
 | `groupPolicy`           | string   | `"open"`     | 群聊策略：open/allowlist                    |
 | `allowFrom`             | string[] | `[]`         | 允许的发送者 ID 列表                        |
 | `mediaUrlAllowlist`     | string[] | `[]`         | 允许通过 `mediaUrl` 下载的主机/IP/CIDR 白名单 |
+| `showThinking`          | boolean  | `true`       | 是否发送“思考中”提示消息（仅 markdown 模式生效） |
+| `thinkingMessage`       | string   | `"🤔 思考中，请稍候..."` | 自定义“思考中”提示文案（showThinking 开启时生效，仅 markdown 模式） |
 | `messageType`           | string   | `"markdown"` | 消息类型：markdown/card                     |
 | `cardTemplateId`        | string   |              | AI 互动卡片模板 ID（仅当 messageType=card） |
 | `cardTemplateKey`       | string   | `"content"`  | 卡片模板内容字段键（仅当 messageType=card） |
@@ -362,14 +399,47 @@ openclaw gateway restart
 
 ### 接收
 
-| 类型   | 支持 | 说明                 |
-| ------ | ---- | -------------------- |
-| 文本   | ✅   | 完整支持             |
-| 富文本 | ✅   | 提取文本内容         |
-| 图片   | ✅   | 下载并传递给 AI      |
-| 语音   | ✅   | 使用钉钉语音识别结果 |
-| 视频   | ✅   | 下载并传递给 AI      |
-| 文件   | ✅   | 下载并传递给 AI      |
+| 类型         | 支持 | 说明                                                                     |
+| ------------ | ---- | ------------------------------------------------------------------------ |
+| 文本         | ✅   | 完整支持                                                                 |
+| 富文本       | ✅   | 提取文本内容                                                             |
+| 图片         | ✅   | 下载并传递给 AI                                                          |
+| 语音         | ✅   | 使用钉钉语音识别结果                                                     |
+| 视频         | ✅   | 下载并传递给 AI                                                          |
+| 文件         | ✅   | 下载并传递给 AI                                                          |
+| 钉钉文档/钉盘文件卡片 | ✅ | 解析 `interactiveCard` 中的 `biz_custom_action_url`，提取 `spaceId/fileId` 后按文件消息下载 |
+| 引用文字     | ✅   | 提取被引用文本作为上下文前缀                                             |
+| 引用图片     | ✅   | 使用引用回调自带的 `downloadCode` 下载并传递给 AI                        |
+| 引用图文     | ✅   | 解析 `richText` 引用内容，提取文本摘要与图片 `downloadCode`              |
+| 引用文件/视频/语音 | ✅ | 单聊按 `msgId` 精确恢复；群聊优先查已固化元数据，首次未命中时走群文件 API 兜底 |
+| 引用钉钉文档/钉盘文件卡片 | ⚠️ | 单聊支持；群聊暂不支持，未支持场景会降级为提示文本 |
+| 引用 AI 卡片 | ✅   | 仅指机器人自己发送的 AI 卡片；按 `carrierId ↔ originalProcessQueryKey` 精确恢复 |
+
+> **引用消息实现说明**
+>
+> 当前实现优先采用“确定性恢复”，仅在钉钉回调未直接提供下载句柄时才退回兜底链路：
+>
+> | 场景 | 实现方式 | 是否依赖时间匹配 |
+> |------|----------|------------------|
+> | 引用文字 | 直接从 `repliedMsg.content.text` 提取 | 否 |
+> | 引用图片 | 直接使用 `repliedMsg.content.downloadCode` 下载 | 否 |
+> | 引用图文（`richText`） | 解析 `repliedMsg.content.richText`，提取文本摘要和图片 `downloadCode` | 否 |
+> | 单聊引用文件/视频/语音 | 原消息入站时持久化 `msgId → {downloadCode, spaceId, fileId}`，引用时按 `originalMsgId/repliedMsg.msgId` 精确命中 | 否 |
+> | 群聊引用文件/视频/语音 | 优先查已持久化的 `msgId → 文件元数据`；若机器人从未见过原文件消息，则首次仍通过群文件存储 API 链路兜底，成功后会把结果反向固化到本地索引 | 首次兜底时**是** |
+> | 单聊引用钉钉文档/钉盘文件卡片 | 原消息入站时持久化 `msgId → {spaceId, fileId}`，引用时按 `originalMsgId/repliedMsg.msgId` 精确命中 | 否 |
+> | 群聊引用钉钉文档/钉盘文件卡片 | 当前暂不支持；即使被引用消息表现为 `interactiveCard`，也不会按机器人 AI 卡片恢复 | 否 |
+> | 引用 AI 卡片（单聊+群聊） | 仅当被引用消息是机器人自己发送的 `interactiveCard` 时，创建卡片时保存 `deliverResults[0].carrierId`，引用时按 `originalProcessQueryKey` 精确命中 | 否 |
+>
+> 说明：
+>
+> - AI 卡片已不再依赖 `createdAt` 时间窗口匹配。
+> - 钉钉文档/钉盘文件卡片在钉钉回调里通常也会表现为 `interactiveCard`，但这类消息来自用户侧，插件会优先解析 `biz_custom_action_url` 中的 `route=previewDentry`、`spaceId`、`fileId`，并按文件消息处理，而不是误判为机器人 AI 卡片。
+> - 图片和图文引用不依赖机器人是否见过原消息，只要引用回调带回 `downloadCode` 即可恢复。
+> - 单聊文件/视频/语音/钉钉文档卡片在机器人见过原消息后可稳定精确恢复，且索引会持久化到本地，机器人重启后仍可复用。
+> - 群聊文件/视频/语音在“原文件消息无法 @ 机器人”的场景下，若机器人从未见过原消息，则首次恢复仍需走群文件 API 兜底；后续再次引用同一文件会优先命中已固化索引。
+> - 群聊引用钉钉文档/钉盘文件卡片当前**不支持**。原因是现有引用回调样本里通常不会补回 `biz_custom_action_url/spaceId/fileId`，而群聊场景下也无法像普通文件那样稳定走现有兜底链路，因此会明确降级为提示文本，而不是误判成机器人 AI 卡片。
+> - 这条群文件兜底链路在部分企业环境下可能受到企业认证限制，表现为 `quotedFile.resolve` 返回 `orgAuthLevelNotEnough`。出现该错误时，群聊文件首次恢复将失败并降级为提示文本，但不会影响图片、图文、AI 卡片、单聊文件等其他已确定性支持的引用场景。
+> - 由于本地引用索引使用 TTL 清理，并按 `accountId + conversationId` 隔离存储，数据不会永久累积。
 
 ### 发送
 
@@ -497,6 +567,8 @@ openclaw gateway restart
 - 支持在卡片中实时显示 AI 思考过程（推理流）和工具执行结果
 - 当前卡片模式仅支持**文本内容流式更新**，不支持图片图文混排
 
+> 这里的 `card` 专指**机器人主动发送的 AI 互动卡片**。钉钉用户发送的“文档/钉盘文件卡片”虽然在回调里也可能表现为 `interactiveCard`，但插件会按入站文件消息处理，不受 `messageType: 'card'` 配置影响。
+
 **AI Card API 特性：**
 当配置 `messageType: 'card'` 时：
 
@@ -618,8 +690,24 @@ await dingtalkPlugin.outbound.sendMedia({
 
 ### 连接失败
 
-1. 检查 clientId 和 clientSecret 是否正确
-2. 确认网络可以访问钉钉 API
+初始化阶段如果只看到 HTTP `400`，它通常不等于“单纯网络不通”；更常见的是钉钉已收到请求，但拒绝了请求内容或当前应用状态不满足要求。
+
+建议先运行仓库内的最小连接检查脚本，确认 `POST /v1.0/gateway/connections/open` 是否成功：
+
+- macOS / Linux: `bash scripts/dingtalk-connection-check.sh --config ~/.openclaw/openclaw.json`
+- Windows PowerShell: `pwsh -File scripts/dingtalk-connection-check.ps1 -Config ~/.openclaw/openclaw.json`
+  - 旧版 Windows 可使用：`powershell.exe -File scripts/dingtalk-connection-check.ps1 -Config $env:USERPROFILE\.openclaw\openclaw.json`
+
+完整排障流程：
+- 英文版：[docs/connection-troubleshooting.md](docs/connection-troubleshooting.md)
+- 中文版：[docs/connection-troubleshooting.zh-CN.md](docs/connection-troubleshooting.zh-CN.md)
+
+如果新日志里出现 `connect.open` 或 `connect.websocket`，也可以直接按文档中的阶段说明来判断：前者优先查钉钉应用配置，后者优先查 WSS / 代理 / 企业网关。
+
+关键设置清单（钉钉后台）
+- 应用为企业内部应用/机器人，且已“发布”版本（不是草稿）
+- 版本管理 → 已发布 → 版本详情：可见范围需为“全员员工”
+- 已开启“机器人能力”，消息接收方式为“Stream 模式”
 
 ### 错误 payload 日志规范（`[ErrorPayload]`）
 
@@ -815,4 +903,4 @@ pnpm test:coverage
 
 ## 许可
 
-MIT
+[MIT](LICENSE)

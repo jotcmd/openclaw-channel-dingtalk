@@ -3,8 +3,10 @@ import { normalizeAllowFrom, isSenderAllowed, isSenderGroupAllowed } from "./acc
 import { getAccessToken } from "./auth";
 import {
   createAICard,
+  findCardContent,
   finishAICard,
   formatContentForCard,
+  getCardContentByProcessQueryKey,
   isCardInTerminalState,
 } from "./card-service";
 import { resolveGroupConfig } from "./config";
@@ -21,9 +23,12 @@ import { sendBySession, sendMessage } from "./send-service";
 import type { DingTalkConfig, HandleDingTalkMessageParams, MediaFile } from "./types";
 import { AICardStatus } from "./types";
 import { acquireSessionLock } from "./session-lock";
+import { cacheInboundDownloadCode, getCachedDownloadCode } from "./quoted-msg-cache";
+import { downloadGroupFile, getUnionIdByStaffId, resolveQuotedFile } from "./quoted-file-service";
 import { formatDingTalkErrorPayloadLog, maskSensitiveData } from "./utils";
 
 const DEFAULT_PROACTIVE_HINT_COOLDOWN_HOURS = 24;
+const DEFAULT_THINKING_MESSAGE = "🤔 思考中，请稍候...";
 const proactiveHintLastSentAt = new Map<string, number>();
 
 export function resetProactivePermissionHintStateForTest(): void {
@@ -367,6 +372,216 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
       mediaType = media.mimeType;
     }
   }
+
+  // Cache downloadCode (+ spaceId/fileId) for quoted file lookups (DM + group).
+  if (content.mediaPath && data.msgId) {
+    cacheInboundDownloadCode(
+      accountId, data.conversationId, data.msgId, content.mediaPath, content.messageType, data.createAt,
+      { spaceId: data.content?.spaceId, fileId: data.content?.fileId, storePath },
+    );
+  }
+
+  // User-sent DingTalk doc / Drive file card: cache msgId -> {spaceId,fileId}
+  // during the original message turn, and try downloading immediately in DM.
+  if (
+    content.messageType === "interactiveCardFile" &&
+    data.msgId &&
+    content.docSpaceId &&
+    content.docFileId
+  ) {
+    cacheInboundDownloadCode(
+      accountId,
+      data.conversationId,
+      data.msgId,
+      undefined,
+      content.messageType,
+      data.createAt,
+      { spaceId: content.docSpaceId, fileId: content.docFileId, storePath },
+    );
+
+    if (!mediaPath && isDirect && data.senderStaffId) {
+      try {
+        const unionId = await getUnionIdByStaffId(dingtalkConfig, data.senderStaffId, log);
+        const docMedia = await downloadGroupFile(
+          dingtalkConfig,
+          content.docSpaceId,
+          content.docFileId,
+          unionId,
+          log,
+        );
+        if (docMedia) {
+          mediaPath = docMedia.path;
+          mediaType = docMedia.mimeType;
+        }
+      } catch (err: any) {
+        log?.warn?.(`[DingTalk] Doc card download failed: ${err.message}`);
+      }
+    }
+  }
+
+  // Try downloading a quoted file from cached downloadCode/spaceId+fileId.
+  const tryDownloadFromCache = async (
+    quotedMsgId: string | undefined,
+  ): Promise<MediaFile | null> => {
+    if (!quotedMsgId) {
+      return null;
+    }
+    const cached = getCachedDownloadCode(accountId, data.conversationId, quotedMsgId, storePath);
+    if (!cached) {
+      return null;
+    }
+    let media: MediaFile | null = null;
+    if (cached.downloadCode) {
+      media = await downloadMedia(dingtalkConfig, cached.downloadCode, log);
+    }
+    if (!media && cached.spaceId && cached.fileId && data.senderStaffId) {
+      try {
+        const unionId = await getUnionIdByStaffId(dingtalkConfig, data.senderStaffId, log);
+        media = await downloadGroupFile(dingtalkConfig, cached.spaceId, cached.fileId, unionId, log);
+      } catch (err: any) {
+        log?.warn?.(`[DingTalk] spaceId+fileId fallback failed: ${err.message}`);
+      }
+    }
+    return media;
+  };
+
+  // Quoted picture: download via existing downloadMedia.
+  if (!mediaPath && content.quoted?.mediaDownloadCode && dingtalkConfig.robotCode) {
+    const media = await downloadMedia(dingtalkConfig, content.quoted.mediaDownloadCode, log);
+    if (media) {
+      mediaPath = media.path;
+      mediaType = media.mimeType;
+    } else {
+      content.text = content.text.replace(
+        content.quoted.prefix, "[引用了一张图片，但下载失败]\n\n",
+      );
+    }
+  }
+
+  // Quoted file/video/audio (unknownMsgType): cache-first, then group file API fallback.
+  if (!mediaPath && content.quoted?.isQuotedFile) {
+    let fileResolved = false;
+
+    // Step 1: Try msgId-based cache (works for both DM and group if bot saw the original message).
+    const cachedMedia = await tryDownloadFromCache(content.quoted.msgId);
+    if (cachedMedia) {
+      mediaPath = cachedMedia.path;
+      mediaType = cachedMedia.mimeType;
+      fileResolved = true;
+    }
+
+    // Step 2 (group only): Cache miss → fall back to group file API time-based matching.
+    if (!fileResolved && !isDirect) {
+      const resolved = await resolveQuotedFile(dingtalkConfig, {
+        openConversationId: data.conversationId,
+        senderStaffId: data.senderStaffId,
+        fileCreatedAt: content.quoted.fileCreatedAt,
+      }, log);
+      if (resolved) {
+        mediaPath = resolved.media.path;
+        mediaType = resolved.media.mimeType;
+        fileResolved = true;
+        if (content.quoted.msgId) {
+          cacheInboundDownloadCode(
+            accountId,
+            data.conversationId,
+            content.quoted.msgId,
+            undefined,
+            "file",
+            content.quoted.fileCreatedAt || Date.now(),
+            { storePath, spaceId: resolved.spaceId, fileId: resolved.fileId },
+          );
+        }
+      }
+    }
+
+    if (!fileResolved) {
+      log?.warn?.(
+        `[DingTalk] Quoted file unresolved: conversationType=${data.conversationType} conversationId=${data.conversationId} quotedMsgId=${content.quoted.msgId || "(none)"}`,
+      );
+      const hint = isDirect
+        ? "[引用了一个文件，内容无法自动获取，请直接发送该文件]\n\n"
+        : "[引用了一个文件，但无法获取内容]\n\n";
+      content.text = content.text.replace(content.quoted.prefix, hint);
+    }
+  }
+
+  // Quoted DingTalk doc / Drive file card:
+  // 1) Prefer msgId-based cached metadata captured when the original doc card
+  //    message was seen.
+  // 2) In group chats, if the bot never saw the original doc card message,
+  //    reuse the same group-file fallback chain as ordinary quoted files.
+  if (!mediaPath && content.quoted?.isQuotedDocCard) {
+    let docResolved = false;
+
+    const cachedDocMedia = await tryDownloadFromCache(content.quoted.msgId);
+    if (cachedDocMedia) {
+      mediaPath = cachedDocMedia.path;
+      mediaType = cachedDocMedia.mimeType;
+      docResolved = true;
+      content.text = content.text.replace(content.quoted.prefix, "[引用了钉钉文档]\n\n");
+    }
+
+    if (!docResolved && !isDirect && content.quoted.fileCreatedAt) {
+      const resolved = await resolveQuotedFile(dingtalkConfig, {
+        openConversationId: data.conversationId,
+        senderStaffId: data.senderStaffId,
+        fileCreatedAt: content.quoted.fileCreatedAt,
+      }, log);
+      if (resolved) {
+        mediaPath = resolved.media.path;
+        mediaType = resolved.media.mimeType;
+        docResolved = true;
+        content.text = content.text.replace(content.quoted.prefix, "[引用了钉钉文档]\n\n");
+        if (content.quoted.msgId) {
+          cacheInboundDownloadCode(
+            accountId,
+            data.conversationId,
+            content.quoted.msgId,
+            undefined,
+            "interactiveCardFile",
+            content.quoted.fileCreatedAt || Date.now(),
+            { storePath, spaceId: resolved.spaceId, fileId: resolved.fileId },
+          );
+        }
+      }
+    }
+
+    if (!docResolved) {
+      log?.warn?.(
+        `[DingTalk] Quoted doc card unresolved: conversationType=${data.conversationType} conversationId=${data.conversationId} quotedMsgId=${content.quoted.msgId || "(none)"}`,
+      );
+      const hint = isDirect
+        ? "[引用了钉钉文档，内容无法自动获取，请直接发送该文档]\n\n"
+        : "[引用了钉钉文档，但无法获取内容]\n\n";
+      content.text = content.text.replace(content.quoted.prefix, hint);
+    }
+  }
+
+  // Quoted AI card: prefer deterministic processQueryKey lookup, and only
+  // fall back to the legacy createdAt matcher when the callback omits that key.
+  if (content.quoted?.isQuotedCard) {
+    const cardContent = content.quoted.processQueryKey
+      ? getCardContentByProcessQueryKey(
+          accountId,
+          to,
+          content.quoted.processQueryKey,
+          accountStorePath,
+        )
+      : content.quoted.cardCreatedAt
+        ? findCardContent(accountId, to, content.quoted.cardCreatedAt, accountStorePath)
+        : null;
+    if (cardContent) {
+      const preview = cardContent.length > 50 ? cardContent.slice(0, 50) + "..." : cardContent;
+      content.text = content.text.replace(content.quoted.prefix, `[引用机器人回复: "${preview}"]\n\n`);
+    }
+    // Card cache miss: prefix already contains "[引用了机器人的回复]", keep as-is.
+  }
+
+  const inboundText =
+    mediaPath && /<media:[^>]+>/.test(content.text)
+      ? `${content.text}\n[media_path: ${mediaPath}]\n[media_type: ${mediaType || "unknown"}]`
+      : content.text;
   const envelopeOptions = rt.channel.reply.resolveEnvelopeFormatOptions(cfg);
   const previousTimestamp = rt.channel.session.readSessionUpdatedAt({
     storePath,
@@ -391,7 +606,7 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
     channel: "DingTalk",
     from: fromLabel,
     timestamp: data.createAt,
-    body: content.text,
+    body: inboundText,
     chatType: isDirect ? "direct" : "group",
     sender: { name: senderName, id: senderId },
     previousTimestamp,
@@ -400,8 +615,8 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
 
   const ctx = rt.channel.reply.finalizeInboundContext({
     Body: body,
-    RawBody: content.text,
-    CommandBody: content.text,
+    RawBody: inboundText,
+    CommandBody: inboundText,
     From: to,
     To: to,
     SessionKey: route.sessionKey,
@@ -443,13 +658,15 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
   // causes empty replies for all but the first caller.
   const releaseSessionLock = await acquireSessionLock(route.sessionKey);
   try {
-    // 4) Optional "thinking..." feedback for non-card mode.
+    // 4) Optional "thinking..." feedback (markdown mode only).
     if (dingtalkConfig.showThinking !== false) {
-      try {
-        const thinkingText = "🤔 思考中，请稍候...";
-        if (useCardMode && currentAICard) {
-          log?.debug?.("[DingTalk] AI Card in thinking state, skipping thinking message send.");
-        } else {
+      const thinkingText = (dingtalkConfig.thinkingMessage || "").trim() || DEFAULT_THINKING_MESSAGE;
+      if (useCardMode && currentAICard) {
+        log?.debug?.(
+          "[DingTalk] messageType=card: showThinking/thinkingMessage do not send standalone hints; thinking is streamed in card mode.",
+        );
+      } else {
+        try {
           lastCardContent = thinkingText;
           const sendResult = await sendMessage(dingtalkConfig, to, thinkingText, {
             sessionWebhook,
@@ -460,11 +677,11 @@ export async function handleDingTalkMessage(params: HandleDingTalkMessageParams)
           if (!sendResult.ok) {
             throw new Error(sendResult.error || "Thinking message send failed");
           }
-        }
-      } catch (err: any) {
-        log?.debug?.(`[DingTalk] Thinking message failed: ${err.message}`);
-        if (err?.response?.data !== undefined) {
-          log?.debug?.(formatDingTalkErrorPayloadLog("inbound.thinkingMessage", err.response.data));
+        } catch (err: any) {
+          log?.debug?.(`[DingTalk] Thinking message failed: ${err.message}`);
+          if (err?.response?.data !== undefined) {
+            log?.debug?.(formatDingTalkErrorPayloadLog("inbound.thinkingMessage", err.response.data));
+          }
         }
       }
     }

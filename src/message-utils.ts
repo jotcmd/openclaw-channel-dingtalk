@@ -1,4 +1,80 @@
-import type { DingTalkInboundMessage, MessageContent, SendMessageOptions } from "./types";
+import type { DingTalkInboundMessage, MessageContent, QuotedInfo, SendMessageOptions } from "./types";
+
+interface DingTalkDocMeta {
+  spaceId: string;
+  fileId: string;
+}
+
+function parseBizCustomActionUrl(url: string | undefined): DingTalkDocMeta | null {
+  if (!url || typeof url !== "string") {
+    return null;
+  }
+
+  const queryIndex = url.indexOf("?");
+  if (queryIndex < 0 || queryIndex === url.length - 1) {
+    return null;
+  }
+
+  try {
+    const params = new URLSearchParams(url.slice(queryIndex + 1));
+    const route = params.get("route");
+    const type = params.get("type");
+    const spaceId = params.get("spaceId");
+    const fileId = params.get("fileId");
+    if (route !== "previewDentry" || type !== "file" || !spaceId || !fileId) {
+      return null;
+    }
+    return { spaceId, fileId };
+  } catch {
+    return null;
+  }
+}
+
+function extractRichTextQuoteParts(
+  richText: Array<Record<string, any>> | undefined,
+): { summary: string; pictureDownloadCode?: string } | null {
+  if (!Array.isArray(richText) || richText.length === 0) {
+    return null;
+  }
+
+  const textParts: string[] = [];
+  let pictureDownloadCode: string | undefined;
+
+  for (const part of richText) {
+    const partType = part.msgType || part.type;
+    const textValue = typeof part.content === "string" ? part.content : part.text;
+
+    if ((partType === "text" || partType === undefined) && textValue) {
+      textParts.push(textValue);
+      continue;
+    }
+    if (partType === "emoji" && textValue) {
+      textParts.push(textValue);
+      continue;
+    }
+    if (partType === "picture") {
+      textParts.push("[图片]");
+      if (!pictureDownloadCode) {
+        pictureDownloadCode = part.downloadCode;
+      }
+      continue;
+    }
+    if (partType === "at") {
+      const atName = part.atName || textValue || "某人";
+      textParts.push(`@${atName}`);
+      continue;
+    }
+    if (textValue) {
+      textParts.push(textValue);
+    }
+  }
+
+  const summary = textParts.join("").trim();
+  if (!summary && !pictureDownloadCode) {
+    return null;
+  }
+  return { summary, pictureDownloadCode };
+}
 
 /**
  * Auto-detect markdown usage and derive message title.
@@ -27,67 +103,111 @@ export function detectMarkdownAndExtractTitle(
 export function extractMessageContent(data: DingTalkInboundMessage): MessageContent {
   const msgtype = data.msgtype || "text";
 
-  // Normalize quote/reply metadata into a readable text prefix so the agent can understand message context.
-  const formatQuotedContent = (): string => {
-    const textField = data.text as any;
+  const formatQuotedContent = (): QuotedInfo | null => {
+    const textField = data.text;
 
     if (textField?.isReplyMsg && textField?.repliedMsg) {
       const repliedMsg = textField.repliedMsg;
-      const content = repliedMsg?.content;
+      const repliedMsgType = repliedMsg.msgType;
+      const content = repliedMsg.content;
 
-      if (content?.text) {
-        const quoteText = content.text.trim();
-        if (quoteText) {
-          return `[引用消息: "${quoteText}"]\n\n`;
+      if (repliedMsgType === "text" && content?.text?.trim()) {
+        return { prefix: `[引用消息: "${content.text.trim()}"]\n\n` };
+      }
+
+      if (repliedMsgType === "picture" && content?.downloadCode) {
+        return {
+          prefix: "[引用图片]\n\n",
+          mediaDownloadCode: content.downloadCode,
+          mediaType: "image",
+        };
+      }
+
+      if (repliedMsgType === "richText") {
+        const richTextQuote = extractRichTextQuoteParts(content?.richText);
+        if (richTextQuote) {
+          const prefix =
+            richTextQuote.summary && richTextQuote.summary !== "[图片]"
+              ? `[引用消息: "${richTextQuote.summary}"]\n\n`
+              : "[引用图片]\n\n";
+          return {
+            prefix,
+            mediaDownloadCode: richTextQuote.pictureDownloadCode,
+            mediaType: richTextQuote.pictureDownloadCode ? "image" : undefined,
+          };
         }
       }
 
-      if (content?.richText && Array.isArray(content.richText)) {
-        const textParts: string[] = [];
-        for (const part of content.richText) {
-          if (part.msgType === "text" && part.content) {
-            textParts.push(part.content);
-          } else if (part.msgType === "emoji" || part.type === "emoji") {
-            textParts.push(part.content || "[表情]");
-          } else if (part.msgType === "picture" || part.type === "picture") {
-            textParts.push("[图片]");
-          } else if (part.msgType === "at" || part.type === "at") {
-            textParts.push(`@${part.content || part.atName || "某人"}`);
-          } else if (part.text) {
-            textParts.push(part.text);
-          }
+      if (repliedMsgType === "unknownMsgType") {
+        return {
+          prefix: "[引用文件]\n\n",
+          isQuotedFile: true,
+          fileCreatedAt: repliedMsg.createdAt,
+          msgId: repliedMsg.msgId,
+        };
+      }
+
+      if (repliedMsgType === "interactiveCard") {
+        const isBotCard = repliedMsg.senderId === data.chatbotUserId;
+        if (isBotCard) {
+          return {
+            prefix: "[引用了机器人的回复]\n\n",
+            isQuotedCard: true,
+            cardCreatedAt: repliedMsg.createdAt,
+            processQueryKey: data.originalProcessQueryKey,
+            msgId: repliedMsg.msgId,
+          };
         }
-        const quoteText = textParts.join("").trim();
-        if (quoteText) {
-          return `[引用消息: "${quoteText}"]\n\n`;
+
+        return {
+          prefix: "[引用了钉钉文档]\n\n",
+          isQuotedDocCard: true,
+          fileCreatedAt: repliedMsg.createdAt,
+          msgId: repliedMsg.msgId,
+        };
+      }
+
+      // Has msgType but not one we handle — generic fallback.
+      if (repliedMsgType) {
+        return { prefix: "[引用了一条消息]\n\n" };
+      }
+
+      // No msgType — backward compat: extract text or richText from content.
+      if (content?.text?.trim()) {
+        return { prefix: `[引用消息: "${content.text.trim()}"]\n\n` };
+      }
+
+      if (content?.richText && Array.isArray(content.richText)) {
+        const richTextQuote = extractRichTextQuoteParts(content.richText);
+        if (richTextQuote?.summary) {
+          return { prefix: `[引用消息: "${richTextQuote.summary}"]\n\n` };
         }
       }
     }
 
-    // Some clients only send originalMsgId for rich media reply messages.
     if (textField?.isReplyMsg && !textField?.repliedMsg && data.originalMsgId) {
-      return `[这是一条引用消息，原消息ID: ${data.originalMsgId}]\n\n`;
+      return { prefix: `[这是一条引用消息，原消息ID: ${data.originalMsgId}]\n\n` };
     }
 
     if (data.quoteMessage) {
       const quoteText = data.quoteMessage.text?.content?.trim() || "";
       if (quoteText) {
-        return `[引用消息: "${quoteText}"]\n\n`;
+        return { prefix: `[引用消息: "${quoteText}"]\n\n` };
       }
     }
 
     if (data.content?.quoteContent) {
-      return `[引用消息: "${data.content.quoteContent}"]\n\n`;
+      return { prefix: `[引用消息: "${data.content.quoteContent}"]\n\n` };
     }
 
-    return "";
+    return null;
   };
 
-  const quotedPrefix = formatQuotedContent();
+  const quoted = formatQuotedContent();
+  const quotedPrefix = quoted?.prefix || "";
 
-  // Unified extraction by DingTalk msgtype for downstream routing/agent processing.
   if (msgtype === "text") {
-    return { text: quotedPrefix + (data.text?.content?.trim() || ""), messageType: "text" };
+    return { text: quotedPrefix + (data.text?.content?.trim() || ""), messageType: "text", quoted: quoted ?? undefined };
   }
 
   if (msgtype === "richText") {
@@ -112,6 +232,7 @@ export function extractMessageContent(data: DingTalkInboundMessage): MessageCont
       mediaPath: pictureDownloadCode,
       mediaType: pictureDownloadCode ? "image" : undefined,
       messageType: "richText",
+      quoted: quoted ?? undefined,
     };
   }
 
@@ -151,6 +272,43 @@ export function extractMessageContent(data: DingTalkInboundMessage): MessageCont
     };
   }
 
-  // Fallback: preserve unknown msgtype as readable marker.
-  return { text: data.text?.content?.trim() || `[${msgtype}消息]`, messageType: msgtype };
+  if (msgtype === "interactiveCard") {
+    const docMeta = parseBizCustomActionUrl(data.content?.biz_custom_action_url);
+    if (docMeta) {
+      return {
+        text: "[钉钉文档]\n\n",
+        messageType: "interactiveCardFile",
+        docSpaceId: docMeta.spaceId,
+        docFileId: docMeta.fileId,
+        quoted: quoted ?? undefined,
+      };
+    }
+    return {
+      text: data.text?.content?.trim() || "[interactiveCard消息]",
+      messageType: msgtype,
+      quoted: quoted ?? undefined,
+    };
+  }
+
+  if (msgtype === "chatRecord") {
+    const summary = String((data.content as any)?.summary || "").trim();
+    const rawRecord = (data.content as any)?.chatRecord;
+    if (
+      summary === "[]" ||
+      (typeof rawRecord === "string" && rawRecord.trim() === "[]") ||
+      (Array.isArray(rawRecord) && rawRecord.length === 0)
+    ) {
+      return {
+        text: "[系统提示] 没有读到引用记录（chatRecord 为空）。请改用逐条转发、复制原文，或重新转发非空聊天记录。",
+        messageType: "chatRecord",
+        quoted: quoted ?? undefined,
+      };
+    }
+    if (summary) {
+      return { text: `[聊天记录摘要] ${summary}`, messageType: "chatRecord", quoted: quoted ?? undefined };
+    }
+    return { text: "[chatRecord消息: 无可读内容]", messageType: "chatRecord", quoted: quoted ?? undefined };
+  }
+
+  return { text: data.text?.content?.trim() || `[${msgtype}消息]`, messageType: msgtype, quoted: quoted ?? undefined };
 }

@@ -87,6 +87,108 @@ export function formatDingTalkErrorPayloadLog(
   return `${prefix}[ErrorPayload][${scope}] ${formatDingTalkErrorPayload(payload)}`;
 }
 
+function getHeaderCaseInsensitive(headers: unknown, key: string): string | undefined {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return undefined;
+  }
+
+  const entries = Object.entries(headers as Record<string, unknown>);
+  const matched = entries.find(([name]) => name.toLowerCase() === key.toLowerCase());
+  if (!matched) {
+    return undefined;
+  }
+
+  const value = matched[1];
+  if (Array.isArray(value)) {
+    return value.length > 0 ? String(value[0]) : undefined;
+  }
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+export function formatDingTalkConnectionErrorLog(
+  scope: string,
+  err: unknown,
+  baseMessage: string,
+): string | null {
+  if (!err || typeof err !== "object") {
+    return null;
+  }
+
+  const errRecord = err as Record<string, unknown>;
+  const stage =
+    typeof errRecord.dingtalkConnectionStage === "string"
+      ? errRecord.dingtalkConnectionStage
+      : scope;
+  const endpoint =
+    typeof errRecord.dingtalkConnectionEndpoint === "string"
+      ? errRecord.dingtalkConnectionEndpoint
+      : undefined;
+
+  const hasResponse = "response" in errRecord && errRecord.response !== null && errRecord.response !== undefined;
+  if (!hasResponse && !endpoint && stage === scope) {
+    return null;
+  }
+
+  const parts: string[] = [`${baseMessage} [DingTalk][ConnectionError][${stage}]`];
+  if (endpoint) {
+    parts.push(`endpoint=${endpoint}`);
+  }
+
+  const response = (err as { response?: { status?: unknown; data?: unknown; headers?: unknown } }).response;
+  if (response) {
+    if (response.status !== undefined && response.status !== null) {
+      const statusText =
+        typeof response.status === "string" ||
+        typeof response.status === "number" ||
+        typeof response.status === "boolean" ||
+        typeof response.status === "bigint"
+          ? String(response.status)
+          : JSON.stringify(response.status);
+      parts.push(`status=${statusText}`);
+    }
+
+    let requestId = getHeaderCaseInsensitive(response.headers, "x-acs-dingtalk-request-id");
+    if (!requestId && response.data && typeof response.data === "object" && !Array.isArray(response.data)) {
+      const data = response.data as Record<string, unknown>;
+      if (typeof data.requestId === "string") {
+        requestId = data.requestId;
+      } else if (typeof data.requestid === "string") {
+        requestId = data.requestid;
+      }
+    }
+    if (requestId) {
+      parts.push(`requestId=${requestId}`);
+    }
+
+    if (response.data !== undefined) {
+      parts.push(formatDingTalkErrorPayload(response.data));
+    }
+  }
+
+  if (stage === "connect.websocket") {
+    parts.push("Likely websocket/proxy/WSS issue after connections/open succeeded");
+  }
+
+  parts.push("See docs/connection-troubleshooting.md or run scripts/dingtalk-connection-check.*");
+
+  return parts.join(" ");
+}
+
 /**
  * Cleanup orphaned temp files from dingtalk media
  * Run at startup to clean up files from crashed processes

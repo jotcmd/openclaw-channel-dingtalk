@@ -39,10 +39,83 @@ import type {
   ResolvedAccount,
 } from "./types";
 import { ConnectionState } from "./types";
-import { cleanupOrphanedTempFiles, formatDingTalkErrorPayloadLog, getCurrentTimestamp } from "./utils";
+import {
+  cleanupOrphanedTempFiles,
+  formatDingTalkConnectionErrorLog,
+  formatDingTalkErrorPayloadLog,
+  getCurrentTimestamp,
+} from "./utils";
+
+type InstrumentedDWClient = {
+  getEndpoint?: () => Promise<unknown>;
+  _connect?: () => Promise<unknown>;
+  config?: Record<string, unknown> & { endpoint?: { endpoint?: string } | string };
+  dw_url?: string;
+};
+
+function attachConnectionErrorContext(
+  err: unknown,
+  stage: "connect.open" | "connect.websocket",
+  endpoint?: string,
+): void {
+  if (!err || typeof err !== "object") {
+    return;
+  }
+  const target = err as Record<string, unknown>;
+  if (typeof target.dingtalkConnectionStage !== "string") {
+    target.dingtalkConnectionStage = stage;
+  }
+  if (endpoint && typeof target.dingtalkConnectionEndpoint !== "string") {
+    target.dingtalkConnectionEndpoint = endpoint;
+  }
+}
+
+function getInstrumentedEndpoint(client: InstrumentedDWClient): string | undefined {
+  if (typeof client.dw_url === "string" && client.dw_url.length > 0) {
+    return client.dw_url;
+  }
+
+  const endpointConfig = client.config?.endpoint;
+  if (typeof endpointConfig === "string") {
+    return endpointConfig;
+  }
+  if (endpointConfig && typeof endpointConfig === "object" && typeof endpointConfig.endpoint === "string") {
+    return endpointConfig.endpoint;
+  }
+  return undefined;
+}
+
+function instrumentConnectionStages(client: DWClient): void {
+  const instrumented = client as unknown as InstrumentedDWClient;
+  if (typeof instrumented.getEndpoint !== "function" || typeof instrumented._connect !== "function") {
+    return;
+  }
+
+  const originalGetEndpoint = instrumented.getEndpoint.bind(instrumented);
+  const originalSocketConnect = instrumented._connect.bind(instrumented);
+
+  instrumented.getEndpoint = async () => {
+    try {
+      return await originalGetEndpoint();
+    } catch (err) {
+      attachConnectionErrorContext(err, "connect.open");
+      throw err;
+    }
+  };
+
+  instrumented._connect = async () => {
+    try {
+      return await originalSocketConnect();
+    } catch (err) {
+      attachConnectionErrorContext(err, "connect.websocket", getInstrumentedEndpoint(instrumented));
+      throw err;
+    }
+  };
+}
 
 const INFLIGHT_TTL_MS = 5 * 60 * 1000; // 5 min safety net for hung handlers
 const processingDedupKeys = new Map<string, number>(); // key → timestamp when acquired
+export const CHANNEL_INFLIGHT_NAMESPACE_POLICY = "memory-only" as const;
 const inboundCountersByAccount = new Map<
   string,
   {
@@ -494,6 +567,8 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         keepAlive: !useConnectionManager,
       });
 
+      instrumentConnectionStages(client);
+
       (client as any).config.autoReconnect = !useConnectionManager;
 
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
@@ -679,7 +754,14 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
             await nativeStopPromise;
           }
         } catch (err: any) {
-          ctx.log?.error?.(`[${account.accountId}] Failed to establish connection: ${err.message}`);
+          ctx.log?.error?.(
+            formatDingTalkConnectionErrorLog(
+              // Use connect.open as base scope; instrumentation can override to connect.websocket
+              "connect.open",
+              err,
+              `[${account.accountId}] Failed to establish connection: ${err.message}`,
+            ) ?? `[${account.accountId}] Failed to establish connection: ${err.message}`,
+          );
           ctx.setStatus({
             ...ctx.getStatus(),
             running: false,
@@ -774,7 +856,14 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
           );
         }
       } catch (err: any) {
-        ctx.log?.error?.(`[${account.accountId}] Failed to establish connection: ${err.message}`);
+        ctx.log?.error?.(
+          formatDingTalkConnectionErrorLog(
+            // Use connect.open as base scope; instrumentation can override to connect.websocket
+            "connect.open",
+            err,
+            `[${account.accountId}] Failed to establish connection: ${err.message}`,
+          ) ?? `[${account.accountId}] Failed to establish connection: ${err.message}`,
+        );
 
         ctx.setStatus({
           ...ctx.getStatus(),
@@ -795,6 +884,7 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
     defaultRuntime: {
       accountId: "default",
       running: false,
+      lastEventAt: null,
       lastStartAt: null,
       lastStopAt: null,
       lastError: null,
@@ -840,18 +930,24 @@ export const dingtalkPlugin: DingTalkChannelPlugin = {
         return { ok: false, error: error.message };
       }
     },
-    buildAccountSnapshot: ({ account, runtime, snapshot, probe }: any) => ({
-      accountId: account.accountId,
-      name: account.name,
-      enabled: account.enabled,
-      configured: account.configured,
-      clientId: account.config?.clientId ?? null,
-      running: runtime?.running ?? snapshot?.running ?? false,
-      lastStartAt: runtime?.lastStartAt ?? snapshot?.lastStartAt ?? null,
-      lastStopAt: runtime?.lastStopAt ?? snapshot?.lastStopAt ?? null,
-      lastError: runtime?.lastError ?? snapshot?.lastError ?? null,
-      probe,
-    }),
+    buildAccountSnapshot: ({ account, runtime, snapshot, probe }: any) => {
+      const running = runtime?.running ?? snapshot?.running ?? false;
+      const persistedLastEventAt = runtime?.lastEventAt ?? snapshot?.lastEventAt ?? null;
+
+      return {
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: account.configured,
+        clientId: account.config?.clientId ?? null,
+        running,
+        lastEventAt: running ? getCurrentTimestamp() : persistedLastEventAt,
+        lastStartAt: runtime?.lastStartAt ?? snapshot?.lastStartAt ?? null,
+        lastStopAt: runtime?.lastStopAt ?? snapshot?.lastStopAt ?? null,
+        lastError: runtime?.lastError ?? snapshot?.lastError ?? null,
+        probe,
+      };
+    },
   },
 };
 

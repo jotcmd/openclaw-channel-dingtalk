@@ -23,11 +23,13 @@ import {
     finalizeActiveCardsForAccount,
     finishAICard,
     formatContentForCard,
+    getCardContentByProcessQueryKey,
     recoverPendingCardsForAccount,
     sendProactiveCardText,
     streamAICard,
 } from '../../src/card-service';
 import { getAccessToken } from '../../src/auth';
+import { resolveNamespacePath } from '../../src/persistence-store';
 import { AICardStatus } from '../../src/types';
 
 const mockedAxios = axios as any;
@@ -36,6 +38,7 @@ const mockedGetAccessToken = vi.mocked(getAccessToken);
 describe('card-service', () => {
     let storePath = '';
     let stateFilePath = '';
+    let legacyStateFilePath = '';
     let stateDirPath = '';
 
     beforeEach(() => {
@@ -49,7 +52,11 @@ describe('card-service', () => {
             `openclaw-dingtalk-card-state-${Date.now()}-${Math.random().toString(16).slice(2)}`
         );
         storePath = path.join(stateDirPath, 'session-store.json');
-        stateFilePath = path.join(stateDirPath, 'dingtalk-active-cards.json');
+        stateFilePath = resolveNamespacePath('cards.active.pending', {
+            storePath,
+            format: 'json',
+        });
+        legacyStateFilePath = path.join(stateDirPath, 'dingtalk-active-cards.json');
         fs.rmSync(stateDirPath, { force: true, recursive: true });
     });
 
@@ -58,7 +65,10 @@ describe('card-service', () => {
     });
 
     it('createAICard returns card instance', async () => {
-        mockedAxios.post.mockResolvedValueOnce({ status: 200, data: { ok: true } });
+        mockedAxios.post.mockResolvedValueOnce({
+            status: 200,
+            data: { result: { deliverResults: [{ carrierId: 'carrier_1' }] } },
+        });
 
         const card = await createAICard(
             { clientId: 'id', clientSecret: 'sec', cardTemplateId: 'tmpl.schema', robotCode: 'id' } as any,
@@ -67,6 +77,7 @@ describe('card-service', () => {
 
         expect(card).toBeTruthy();
         expect(card?.state).toBe(AICardStatus.PROCESSING);
+        expect(card?.processQueryKey).toBe('carrier_1');
         expect(mockedAxios.post).toHaveBeenCalledTimes(1);
         const body = mockedAxios.post.mock.calls[0]?.[1];
         expect(body.cardData?.cardParamMap).toEqual({ content: '' });
@@ -152,6 +163,29 @@ describe('card-service', () => {
         await finishAICard(card, 'final text');
 
         expect(card.state).toBe(AICardStatus.FINISHED);
+    });
+
+    it('finishAICard persists card content by processQueryKey', async () => {
+        mockedAxios.put.mockResolvedValueOnce({ status: 200, data: { ok: true } });
+
+        const card = {
+            cardInstanceId: 'card_quoted',
+            processQueryKey: 'carrier_quoted',
+            accessToken: 'token_abc',
+            conversationId: 'cidA1B2C3',
+            accountId: 'main',
+            storePath,
+            createdAt: Date.now(),
+            lastUpdated: Date.now(),
+            state: AICardStatus.INPUTING,
+            config: { cardTemplateKey: 'content' },
+        } as any;
+
+        await finishAICard(card, 'final text');
+
+        expect(getCardContentByProcessQueryKey('main', 'cidA1B2C3', 'carrier_quoted', storePath)).toBe(
+            'final text'
+        );
     });
 
     it('streamAICard marks FAILED and sends mismatch notification on 500 unknownError', async () => {
@@ -367,5 +401,37 @@ describe('card-service', () => {
         expect(mockedAxios.post).toHaveBeenCalledTimes(1);
         expect(mockedAxios.put).toHaveBeenCalledTimes(1);
         expect(fs.existsSync(stateFilePath)).toBe(false);
+        expect(fs.existsSync(legacyStateFilePath)).toBe(false);
+    });
+
+    it('recovers from legacy pending state file and migrates to namespaced file', async () => {
+        const pending = {
+            version: 1,
+            updatedAt: Date.now(),
+            pendingCards: [
+                {
+                    accountId: 'main',
+                    cardInstanceId: 'card_legacy_1',
+                    conversationId: 'cid_legacy_1',
+                    createdAt: Date.now() - 1000,
+                    lastUpdated: Date.now() - 1000,
+                    state: '1',
+                },
+            ],
+        };
+        fs.mkdirSync(path.dirname(legacyStateFilePath), { recursive: true });
+        fs.writeFileSync(legacyStateFilePath, JSON.stringify(pending, null, 2));
+        mockedAxios.put.mockResolvedValueOnce({ status: 200, data: { ok: true } });
+
+        const recovered = await recoverPendingCardsForAccount(
+            { clientId: 'id', clientSecret: 'sec', cardTemplateId: 'tmpl.schema', robotCode: 'id' } as any,
+            'main',
+            storePath
+        );
+
+        expect(recovered).toBe(1);
+        expect(fs.existsSync(stateFilePath)).toBe(true);
+        const namespaced = JSON.parse(fs.readFileSync(stateFilePath, 'utf-8'));
+        expect(namespaced.pendingCards).toHaveLength(0);
     });
 });
